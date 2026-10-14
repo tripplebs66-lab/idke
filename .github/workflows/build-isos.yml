@@ -1,0 +1,139 @@
+name: Build Manager and Managed ISOs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-isos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize Build Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y live-build debootstrap squashfs-tools xorriso
+
+      - name: Build Managed OS ISO
+        run: |
+          mkdir -p ~/managed-os && cd ~/managed-os
+          lb config --distribution bookworm --architectures amd64 --binary-images iso-hybrid
+
+          cat << 'EOF' > config/package-lists/managed.list.chroot
+          task-xfce-desktop
+          lightdm
+          scrot
+          python3
+          python3-flask
+          network-manager
+          EOF
+
+          mkdir -p config/includes.chroot/usr/local/bin
+          cat << 'EOF' > config/includes.chroot/usr/local/bin/screenshot-agent.py
+          #!/usr/bin/env python3
+          import os, subprocess
+          from flask import Flask, send_file
+          app = Flask(__name__)
+          @app.route("/screenshot")
+          def take_screenshot():
+              env = os.environ.copy()
+              env["DISPLAY"] = ":0"
+              subprocess.run(["scrot", "-o", "/tmp/screen.png"], env=env, check=True)
+              return send_file("/tmp/screen.png", mimetype="image/png")
+          if __name__ == "__main__":
+              app.run(host="0.0.0.0", port=5000)
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/screenshot-agent.py
+
+          mkdir -p config/includes.chroot/etc/xdg/autostart
+          cat << 'EOF' > config/includes.chroot/etc/xdg/autostart/screenshot-agent.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Managed Screenshot Agent
+          Exec=/usr/local/bin/screenshot-agent.py
+          EOF
+
+          mkdir -p config/includes.chroot/etc/lightdm
+          cat << 'EOF' > config/includes.chroot/etc/lightdm/lightdm.conf
+          [Seat:*]
+          autologin-user=user
+          autologin-user-timeout=0
+          EOF
+
+          sudo lb build
+          mv live-image-amd64.hybrid.iso $GITHUB_WORKSPACE/managed-os.iso
+
+      - name: Build Manager OS ISO
+        run: |
+          mkdir -p ~/manager-os && cd ~/manager-os
+          lb config --distribution bookworm --architectures amd64 --binary-images iso-hybrid
+
+          cat << 'EOF' > config/package-lists/manager.list.chroot
+          xorg
+          openbox
+          lightdm
+          chromium
+          python3
+          python3-flask
+          network-manager
+          EOF
+
+          mkdir -p config/includes.chroot/usr/local/bin
+          cat << 'EOF' > config/includes.chroot/usr/local/bin/manager-ui.py
+          #!/usr/bin/env python3
+          from flask import Flask, render_template_string
+          app = Flask(__name__)
+          HTML = """
+          <!DOCTYPE html>
+          <html>
+          <head><title>OS Manager</title></head>
+          <body style="background:#121212;color:#fff;font-family:sans-serif;text-align:center;padding:20px;">
+            <h1>Manager OS Console</h1>
+            <input id="ip" placeholder="Managed PC IP (e.g. 192.168.1.50)" style="padding:10px;width:240px;">
+            <button onclick="grab()" style="padding:10px 20px;cursor:pointer;">Get Screenshot</button>
+            <br><br>
+            <img id="screen" style="max-width:90%;border:2px solid #444;display:none;">
+            <script>
+              function grab() {
+                const ip = document.getElementById('ip').value.trim();
+                const img = document.getElementById('screen');
+                img.style.display = 'inline-block';
+                img.src = 'http://' + ip + ':5000/screenshot?t=' + Date.now();
+              }
+            </script>
+          </body>
+          </html>
+          """
+          @app.route("/")
+          def index():
+              return render_template_string(HTML)
+          if __name__ == "__main__":
+              app.run(host="127.0.0.1", port=8080)
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/manager-ui.py
+
+          mkdir -p config/includes.chroot/etc/xdg/openbox
+          cat << 'EOF' > config/includes.chroot/etc/xdg/openbox/autostart
+          /usr/local/bin/manager-ui.py &
+          sleep 2
+          chromium --kiosk http://127.0.0.1:8080 &
+          EOF
+
+          mkdir -p config/includes.chroot/etc/lightdm
+          cat << 'EOF' > config/includes.chroot/etc/lightdm/lightdm.conf
+          [Seat:*]
+          autologin-user=user
+          autologin-user-timeout=0
+          EOF
+
+          sudo lb build
+          mv live-image-amd64.hybrid.iso $GITHUB_WORKSPACE/manager-os.iso
+
+      - name: Upload Built ISOs for Download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dual-Distro-ISOs
+          path: |
+            ${{ github.workspace }}/managed-os.iso
+            ${{ github.workspace }}/manager-os.iso
